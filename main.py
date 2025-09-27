@@ -6,26 +6,25 @@ import requests
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
-# ========= Config via environment =========
-API_ID = int(os.environ["TG_API_ID"])                 # from https://my.telegram.org
+# ========= Required config via environment =========
+API_ID = int(os.environ["TG_API_ID"])            # from https://my.telegram.org
 API_HASH = os.environ["TG_API_HASH"]
+DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+
+# ========= Optional config =========
 SESSION_NAME = os.environ.get("TG_SESSION", "forwarder")
+PREFIX = os.environ.get("DISCORD_PREFIX", "")    # e.g. "[ANNOUNCEMENTS] "
+DISABLE_PREVIEW = os.environ.get("DISABLE_PREVIEW", "").lower() in {"1", "true", "yes"}
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MiB default
 
 # Channels: either TG_CHANNELS (comma-separated) or TG_CHANNEL (single)
 _single = os.environ.get("TG_CHANNEL", "").strip()
 _multi = os.environ.get("TG_CHANNELS", "").strip()
 
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
-PREFIX = os.environ.get("DISCORD_PREFIX", "")         # e.g. "[ANNOUNCEMENTS] "
-DISABLE_PREVIEW = os.environ.get("DISABLE_PREVIEW", "").lower() in {"1", "true", "yes"}
-
-# Optional hard cap for uploads (bytes). Discord webhooks commonly ~8 MiB limit.
-# If file exceeds this, we’ll skip uploading and just send text+link.
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MiB default
-
 # ========= Helpers =========
 def _to_target(s: str):
-    s = s.strip()
+    """Parse one target: '@username' stays str, numeric ids become int."""
+    s = s.strip().strip('"').strip("'")
     if not s:
         return None
     if s.startswith("@"):
@@ -55,6 +54,7 @@ if not TARGETS:
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 def post_text_to_discord(text: str):
+    """Send a simple text message to Discord with minimal 429 backoff."""
     payload = {"content": text[:2000] or "."}
     for attempt in range(5):
         r = requests.post(DISCORD_WEBHOOK, json=payload)
@@ -68,6 +68,7 @@ def post_text_to_discord(text: str):
     print("Discord text post failed:", r.status_code, getattr(r, "text", ""))
 
 def post_file_to_discord(file_path: str, content: str | None = None, username: str | None = None):
+    """Upload a file (image) with optional caption to Discord webhook."""
     data = {}
     if content:
         data["content"] = content[:2000]
@@ -87,20 +88,31 @@ def post_file_to_discord(file_path: str, content: str | None = None, username: s
     print("Discord file post failed:", r.status_code, getattr(r, "text", ""))
 
 def build_link(username: str | None, message_id: int | None) -> str:
+    """Return a public t.me link for messages in public channels."""
     if username and message_id:
         raw = f"https://t.me/{username}/{message_id}"
         return f"<{raw}>" if DISABLE_PREVIEW else raw
     return ""
 
-def short_caption(prefix_title: str, text: str, link: str) -> str:
+def build_message(title: str, text: str, link: str) -> str:
+    """
+    Formats as:
+
+    [Channel Title]
+
+    message text
+
+    https://t.me/...
+    """
+    parts = [f"{PREFIX}[{title}]"]
+    if text:
+        parts += ["", text]            # blank line before text
     if link:
-        return f"{PREFIX}[{prefix_title}] {text}\n{link}" if text else f"{PREFIX}[{prefix_title}]\n{link}"
-    return f"{PREFIX}[{prefix_title}] {text}" if text else f"{PREFIX}[{prefix_title}]"
+        parts += ["", link]            # blank line before link
+    return "\n".join(parts)
 
 def is_image_document(msg) -> bool:
-    """
-    Returns True if msg has a document that is an image (mime 'image/*').
-    """
+    """True if the message document is an image (mime 'image/*')."""
     try:
         doc = msg.document
         if not doc:
@@ -110,12 +122,13 @@ def is_image_document(msg) -> bool:
     except Exception:
         return False
 
+# ========= Handler =========
 @client.on(events.NewMessage(chats=TARGETS))
 async def on_new_message(event):
     msg = event.message
     raw_text = (msg.message or "").strip()
 
-    # Identify chat + username for link
+    # Get title + username for building link
     try:
         chat = await event.get_chat()
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or "Telegram"
@@ -124,57 +137,52 @@ async def on_new_message(event):
         title, username = "Telegram", None
 
     link = build_link(username, msg.id)
-    caption = short_caption(title, raw_text, link)
+    message = build_message(title, raw_text, link)
 
-    # --- If message has an image, upload it (images only) ---
-    # Case 1: Photo media (standard Telegram photos)
+    # --- Images only (plus text-only fallback) ---
     if isinstance(msg.media, MessageMediaPhoto):
-        # Download to tmp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
             path = await client.download_media(msg.media, file=tf.name)
         try:
-            # size check
             if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
-                post_file_to_discord(path, content=caption)
+                post_file_to_discord(path, content=message)
             else:
-                # too large -> fallback to text only
-                post_text_to_discord(caption + "\n(Attachment too large to upload)")
+                post_text_to_discord(message + "\n(Attachment too large to upload)")
         finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            try: os.remove(path)
+            except Exception: pass
         return
 
-    # Case 2: Document that is an image (e.g., PNG/JPG sent as file)
     if isinstance(msg.media, MessageMediaDocument) and is_image_document(msg):
-        # Try to preserve extension if known; fallback to .img
+        # Try to keep a sensible extension from mime type
         ext = ".img"
         mime = getattr(msg.document, "mime_type", "") or ""
         if "/" in mime:
             maybe_ext = "." + mime.split("/")[-1].lower()
-            if len(maybe_ext) <= 6:  # crude guard
+            if 1 <= len(maybe_ext) <= 6:
                 ext = maybe_ext
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
             path = await client.download_media(msg.media, file=tf.name)
         try:
             if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
-                post_file_to_discord(path, content=caption)
+                post_file_to_discord(path, content=message)
             else:
-                post_text_to_discord(caption + "\n(Attachment too large to upload)")
+                post_text_to_discord(message + "\n(Attachment too large to upload)")
         finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            try: os.remove(path)
+            except Exception: pass
         return
 
-    # --- Otherwise, handle plain text only ---
+    # Text-only messages
     if raw_text:
-        post_text_to_discord(caption)
-    # Ignore non-image, non-text messages in this minimal script
+        post_text_to_discord(message)
+    # Ignore other media types by design
 
+# ========= Entrypoint =========
 async def main():
+    # Optional sanity prints
+    print("API_ID:", API_ID, "| HASH len:", len(API_HASH))
+    print("Targets:", TARGETS)
     await client.start()  # first run: asks phone/code/(2FA)
     print("Running. Listening to channels:")
     for t in TARGETS:
