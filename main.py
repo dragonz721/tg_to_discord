@@ -1,8 +1,10 @@
+# main.py (Python 3.8/3.9 compatible)
 import os
 import asyncio
 import time
 import tempfile
 import requests
+from typing import Optional
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
 
@@ -67,7 +69,7 @@ def post_text_to_discord(text: str):
         time.sleep(1 + attempt)
     print("Discord text post failed:", r.status_code, getattr(r, "text", ""))
 
-def post_file_to_discord(file_path: str, content: str | None = None, username: str | None = None):
+def post_file_to_discord(file_path: str, content: Optional[str] = None, username: Optional[str] = None):
     """Upload a file (image) with optional caption to Discord webhook."""
     data = {}
     if content:
@@ -87,7 +89,7 @@ def post_file_to_discord(file_path: str, content: str | None = None, username: s
         time.sleep(1 + attempt)
     print("Discord file post failed:", r.status_code, getattr(r, "text", ""))
 
-def build_link(username: str | None, message_id: int | None) -> str:
+def build_link(username: Optional[str], message_id: Optional[int]) -> str:
     """Return a public t.me link for messages in public channels."""
     if username and message_id:
         raw = f"https://t.me/{username}/{message_id}"
@@ -181,6 +183,7 @@ async def on_new_message(event):
 # ========= Entrypoint =========
 async def main():
     # Optional sanity prints
+    print("Python version:", os.popen("python -V").read().strip())
     print("API_ID:", API_ID, "| HASH len:", len(API_HASH))
     print("Targets:", TARGETS)
     await client.start()  # first run: asks phone/code/(2FA)
