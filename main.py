@@ -1,9 +1,11 @@
-# main.py (Python 3.8/3.9 compatible)
+# main.py — logs forwarded messages (Python 3.8/3.9 compatible)
+
 import os
 import asyncio
 import time
 import tempfile
 import requests
+import logging
 from typing import Optional
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -18,6 +20,16 @@ SESSION_NAME = os.environ.get("TG_SESSION", "forwarder")
 PREFIX = os.environ.get("DISCORD_PREFIX", "")    # e.g. "[ANNOUNCEMENTS] "
 DISABLE_PREVIEW = os.environ.get("DISABLE_PREVIEW", "").lower() in {"1", "true", "yes"}
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MiB default
+
+# Logging config
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()   # INFO, DEBUG, WARNING, ...
+LOG_FILE = os.environ.get("LOG_FILE")                     # e.g. /var/log/tg_to_discord.log
+logger = logging.getLogger("tg_to_discord")
+if not logger.handlers:
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    handler = logging.FileHandler(LOG_FILE) if LOG_FILE else logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
 
 # Channels: either TG_CHANNELS (comma-separated) or TG_CHANNEL (single)
 _single = os.environ.get("TG_CHANNEL", "").strip()
@@ -55,6 +67,11 @@ if not TARGETS:
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
+def _collapse(text: str, limit: int = 160) -> str:
+    """One-line preview of text for logs."""
+    t = " ".join((text or "").split())
+    return (t[:limit - 1] + "…") if len(t) > limit else t
+
 def post_text_to_discord(text: str):
     """Send a simple text message to Discord with minimal 429 backoff."""
     payload = {"content": text[:2000] or "."}
@@ -64,10 +81,11 @@ def post_text_to_discord(text: str):
             return
         if r.status_code == 429:
             wait = float(r.headers.get("Retry-After", "1"))
+            logger.warning("Discord 429 rate limit: retrying after %.2fs", wait)
             time.sleep(wait)
             continue
+        logger.error("Discord text post failed (status %s): %s", r.status_code, getattr(r, "text", ""))
         time.sleep(1 + attempt)
-    print("Discord text post failed:", r.status_code, getattr(r, "text", ""))
 
 def post_file_to_discord(file_path: str, content: Optional[str] = None, username: Optional[str] = None):
     """Upload a file (image) with optional caption to Discord webhook."""
@@ -84,10 +102,11 @@ def post_file_to_discord(file_path: str, content: Optional[str] = None, username
             return
         if r.status_code == 429:
             wait = float(r.headers.get("Retry-After", "1"))
+            logger.warning("Discord 429 rate limit (file): retrying after %.2fs", wait)
             time.sleep(wait)
             continue
+        logger.error("Discord file post failed (status %s): %s", r.status_code, getattr(r, "text", ""))
         time.sleep(1 + attempt)
-    print("Discord file post failed:", r.status_code, getattr(r, "text", ""))
 
 def build_link(username: Optional[str], message_id: Optional[int]) -> str:
     """Return a public t.me link for messages in public channels."""
@@ -146,9 +165,14 @@ async def on_new_message(event):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
             path = await client.download_media(msg.media, file=tf.name)
         try:
-            if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
+            size = os.path.getsize(path)
+            if size <= MAX_UPLOAD_BYTES:
+                logger.info("IMAGE → Discord | channel='%s' | size=%d | caption='%s' | link='%s'",
+                            title, size, _collapse(raw_text), link or "-")
                 post_file_to_discord(path, content=message)
             else:
+                logger.warning("SKIP IMAGE (too large) | channel='%s' | size=%d > %d | link='%s'",
+                               title, size, MAX_UPLOAD_BYTES, link or "-")
                 post_text_to_discord(message + "\n(Attachment too large to upload)")
         finally:
             try: os.remove(path)
@@ -166,9 +190,14 @@ async def on_new_message(event):
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tf:
             path = await client.download_media(msg.media, file=tf.name)
         try:
-            if os.path.getsize(path) <= MAX_UPLOAD_BYTES:
+            size = os.path.getsize(path)
+            if size <= MAX_UPLOAD_BYTES:
+                logger.info("IMAGE → Discord | channel='%s' | size=%d | caption='%s' | link='%s'",
+                            title, size, _collapse(raw_text), link or "-")
                 post_file_to_discord(path, content=message)
             else:
+                logger.warning("SKIP IMAGE (too large) | channel='%s' | size=%d > %d | link='%s'",
+                               title, size, MAX_UPLOAD_BYTES, link or "-")
                 post_text_to_discord(message + "\n(Attachment too large to upload)")
         finally:
             try: os.remove(path)
@@ -177,19 +206,19 @@ async def on_new_message(event):
 
     # Text-only messages
     if raw_text:
+        logger.info("TEXT → Discord | channel='%s' | text='%s' | link='%s'",
+                    title, _collapse(raw_text), link or "-")
         post_text_to_discord(message)
-    # Ignore other media types by design
+    else:
+        logger.debug("IGNORED non-text/non-image message id=%s in channel='%s'", msg.id, title)
 
 # ========= Entrypoint =========
 async def main():
-    # Optional sanity prints
-    print("Python version:", os.popen("python -V").read().strip())
-    print("API_ID:", API_ID, "| HASH len:", len(API_HASH))
-    print("Targets:", TARGETS)
+    logger.info("Starting… API_ID=%s HASH_len=%s Targets=%s", API_ID, len(API_HASH), TARGETS)
     await client.start()  # first run: asks phone/code/(2FA)
-    print("Running. Listening to channels:")
+    logger.info("Running. Listening to channels:")
     for t in TARGETS:
-        print(" -", t)
+        logger.info(" - %s", t)
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
