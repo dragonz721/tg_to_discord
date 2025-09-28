@@ -1,4 +1,4 @@
-# main.py — logs forwarded messages (Python 3.8/3.9 compatible)
+# main.py — logs forwarded messages + startup announcement (Python 3.8/3.9 compatible)
 
 import os
 import asyncio
@@ -143,6 +143,22 @@ def is_image_document(msg) -> bool:
     except Exception:
         return False
 
+async def _display_name_for_target(client: TelegramClient, target) -> str:
+    """Return a user-friendly display for startup announcement."""
+    try:
+        if isinstance(target, str) and target.startswith("@"):
+            return target
+        ent = await client.get_entity(target)
+        uname = getattr(ent, "username", None)
+        if uname:
+            return f"@{uname}"
+        title = getattr(ent, "title", None)
+        if title:
+            return f"[{title}]"
+        return str(getattr(ent, "id", target))
+    except Exception:
+        return str(target)
+
 # ========= Handler =========
 @client.on(events.NewMessage(chats=TARGETS))
 async def on_new_message(event):
@@ -215,10 +231,18 @@ async def on_new_message(event):
 # ========= Entrypoint =========
 async def main():
     logger.info("Starting… API_ID=%s HASH_len=%s Targets=%s", API_ID, len(API_HASH), TARGETS)
-    await client.start()  # first run: asks phone/code/(2FA)
+    await client.start()  # first run: prompts phone/code/(2FA) in interactive terminal
+
+    # Build a friendly list of channel names for announcement
+    displays = await asyncio.gather(*[_display_name_for_target(client, t) for t in TARGETS])
+    announce = "Started listening to channels: " + ", ".join(displays)
+    logger.info(announce)
+    post_text_to_discord(announce)
+
     logger.info("Running. Listening to channels:")
-    for t in TARGETS:
+    for t in displays:
         logger.info(" - %s", t)
+
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
