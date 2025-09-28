@@ -1,4 +1,4 @@
-# main.py — Telegram ➜ Discord forwarder (robust startup)
+# main.py — Telegram ➜ Discord forwarder (robust startup, TTY-friendly)
 # Python 3.8/3.9 compatible
 
 import os
@@ -23,16 +23,20 @@ SESSION_NAME = os.environ.get("TG_SESSION", "forwarder")
 PREFIX = os.environ.get("DISCORD_PREFIX", "")    # e.g. "[ANNOUNCEMENTS] "
 DISABLE_PREVIEW = os.environ.get("DISABLE_PREVIEW", "").lower() in {"1", "true", "yes"}
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))  # 8 MiB default
-FORCE_HEADLESS = os.environ.get("FORCE_HEADLESS", "").lower() in {"1", "true", "yes"}
+
+# Startup behavior
+FORCE_HEADLESS   = os.environ.get("FORCE_HEADLESS", "").lower() in {"1", "true", "yes"}
+START_TIMEOUT    = int(os.environ.get("START_TIMEOUT", "120"))     # TTY overall start timeout
+CONNECT_TIMEOUT  = int(os.environ.get("CONNECT_TIMEOUT", "30"))    # headless connect timeout
 
 # Logging
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.environ.get("LOG_FILE")
+LOG_LEVEL   = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FILE    = os.environ.get("LOG_FILE")
 TELETHON_LOG = os.environ.get("TELETHON_LOG", "")
 
 # Channels: either TG_CHANNELS (comma-separated) or TG_CHANNEL (single)
 _single = os.environ.get("TG_CHANNEL", "").strip()
-_multi = os.environ.get("TG_CHANNELS", "").strip()
+_multi  = os.environ.get("TG_CHANNELS", "").strip()
 
 # Optional proxy env
 SOCKS5_HOST = os.environ.get("SOCKS5_HOST")
@@ -187,10 +191,10 @@ client = TelegramClient(
     SESSION_NAME,
     API_ID,
     API_HASH,
-    connection_retries=2,
-    request_retries=2,
+    connection_retries=3,
+    request_retries=3,
     retry_delay=2,
-    timeout=8,
+    timeout=10,
     use_ipv6=False,
     proxy=PROXY
 )
@@ -258,7 +262,7 @@ async def on_new_message(event):
         logger.info("TEXT → Discord | channel='%s' | link='%s'", title, link or "-")
         post_text_to_discord(message)
 
-# ========= Entrypoint (bounded connect + conditional prompt) =========
+# ========= Entrypoint (TTY uses start(); headless uses bounded connect) =========
 async def main():
     logger.info("Starting… API_ID=%s HASH_len=%s Targets=%s Proxy=%s",
                 API_ID, len(API_HASH), TARGETS, bool(PROXY))
@@ -266,48 +270,54 @@ async def main():
     headless = FORCE_HEADLESS or not sys.stdin.isatty()
     logger.info("Mode: %s", "HEADLESS" if headless else "INTERACTIVE TTY")
 
-    # 1) Try a bounded connect first (fast failure if network blocked)
-    try:
-        await asyncio.wait_for(client.connect(), timeout=15)
-    except asyncio.TimeoutError:
-        err = "Startup error: connect() timed out (network blocked/blackholed?)."
-        logger.error(err); post_text_to_discord(err); return
-    except Exception as e:
-        err = f"Startup error: failed to connect to Telegram: {e}"
-        logger.error(err); post_text_to_discord(err); return
-
-    # Don't trust connect() return; verify:
-    try:
-        if not client.is_connected():
-            err = "Startup error: client not connected after connect()."
-            logger.error(err); post_text_to_discord(err); return
-    except Exception as e:
-        err = f"Startup error: connection state check failed: {e}"
-        logger.error(err); post_text_to_discord(err); return
-
-    # 2) Check authorization
-    try:
-        authed = await client.is_user_authorized()
-    except Exception as e:
-        err = f"Startup error: authorization check failed: {e}"
-        logger.error(err); post_text_to_discord(err); return
-
-    # 3) If not authorized: prompt (interactive) or fail fast (headless)
-    if not authed:
-        if headless:
-            err = ("Startup error: session not authorized and no TTY available. "
-                   "Run `python main.py` once in an interactive shell to log in.")
-            logger.error(err); post_text_to_discord(err); return
-        logger.info("No session found. Will prompt for login now (phone/code/2FA)…")
-        # Flush a clear notice before Telethon's input() prompt:
-        print(">>> When prompted, enter your PHONE (with country code), then the CODE from Telegram.", flush=True)
+    if headless:
+        # --- Headless path: bounded connect, verify, and ensure already authorized ---
+        logger.info("Headless connect: timeout=%ss …", CONNECT_TIMEOUT)
         try:
-            await client.start()  # will prompt now
+            await asyncio.wait_for(client.connect(), timeout=CONNECT_TIMEOUT)
+            if not client.is_connected():
+                raise RuntimeError("client not connected after connect()")
+            authed = await client.is_user_authorized()
+            if not authed:
+                raise RuntimeError("session not authorized and no TTY to prompt")
+        except asyncio.TimeoutError:
+            err = "Startup error: connect() timed out (network blocked/blackholed?)."
+            logger.error(err); post_text_to_discord(err)
+            try:
+                if client.is_connected(): await client.disconnect()
+            except Exception: pass
+            return
+        except Exception as e:
+            err = f"Startup error (headless): {e}"
+            logger.error(err); post_text_to_discord(err)
+            try:
+                if client.is_connected(): await client.disconnect()
+            except Exception: pass
+            return
+    else:
+        # --- Interactive path: let Telethon manage connect/auth, with a generous timeout ---
+        logger.info("Interactive start(): overall timeout=%ss …", START_TIMEOUT)
+        try:
+            await asyncio.wait_for(client.start(), timeout=START_TIMEOUT)
+            if not client.is_connected():
+                raise RuntimeError("client not connected after start()")
+        except asyncio.TimeoutError:
+            err = ("Startup error: start() timed out. Network slow or blocked. "
+                   "Try increasing START_TIMEOUT or set proxy env (SOCKS5/HTTP).")
+            logger.error(err); post_text_to_discord(err)
+            try:
+                if client.is_connected(): await client.disconnect()
+            except Exception: pass
+            return
         except Exception as e:
             err = f"Startup error: interactive start() failed: {e}"
-            logger.error(err); post_text_to_discord(err); return
+            logger.error(err); post_text_to_discord(err)
+            try:
+                if client.is_connected(): await client.disconnect()
+            except Exception: pass
+            return
 
-    # 4) Announce success
+    # Announce success
     try:
         displays = await asyncio.gather(*[_display_name_for_target(client, t) for t in TARGETS])
     except Exception:
