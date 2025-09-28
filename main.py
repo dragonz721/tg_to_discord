@@ -1,6 +1,8 @@
-# main.py — logs forwarded messages + startup announcement (Python 3.8/3.9 compatible)
+# main.py — robust startup (connect + auth check + Discord announcements)
+# Python 3.8/3.9 compatible
 
 import os
+import sys
 import asyncio
 import time
 import tempfile
@@ -65,25 +67,22 @@ TARGETS = parse_targets(_single, _multi)
 if not TARGETS:
     raise SystemExit("No channels provided. Set TG_CHANNELS='@chan1,-100123...' or TG_CHANNEL='@one'.")
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-def _collapse(text: str, limit: int = 160) -> str:
-    """One-line preview of text for logs."""
-    t = " ".join((text or "").split())
-    return (t[:limit - 1] + "…") if len(t) > limit else t
-
 def post_text_to_discord(text: str):
     """Send a simple text message to Discord with minimal 429 backoff."""
     payload = {"content": text[:2000] or "."}
     for attempt in range(5):
-        r = requests.post(DISCORD_WEBHOOK, json=payload)
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        except requests.RequestException as e:
+            logger.warning("Discord post exception: %s", e)
+            time.sleep(1 + attempt)
+            continue
         if r.status_code == 204 or r.ok:
             return
         if r.status_code == 429:
             wait = float(r.headers.get("Retry-After", "1"))
             logger.warning("Discord 429 rate limit: retrying after %.2fs", wait)
-            time.sleep(wait)
-            continue
+            time.sleep(wait); continue
         logger.error("Discord text post failed (status %s): %s", r.status_code, getattr(r, "text", ""))
         time.sleep(1 + attempt)
 
@@ -95,16 +94,20 @@ def post_file_to_discord(file_path: str, content: Optional[str] = None, username
     if username:
         data["username"] = username
     for attempt in range(5):
-        with open(file_path, "rb") as f:
-            files = {"file": (os.path.basename(file_path), f)}
-            r = requests.post(DISCORD_WEBHOOK, data=data, files=files)
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                r = requests.post(DISCORD_WEBHOOK, data=data, files=files, timeout=30)
+        except requests.RequestException as e:
+            logger.warning("Discord file post exception: %s", e)
+            time.sleep(1 + attempt)
+            continue
         if r.ok or r.status_code == 204:
             return
         if r.status_code == 429:
             wait = float(r.headers.get("Retry-After", "1"))
             logger.warning("Discord 429 rate limit (file): retrying after %.2fs", wait)
-            time.sleep(wait)
-            continue
+            time.sleep(wait); continue
         logger.error("Discord file post failed (status %s): %s", r.status_code, getattr(r, "text", ""))
         time.sleep(1 + attempt)
 
@@ -159,6 +162,18 @@ async def _display_name_for_target(client: TelegramClient, target) -> str:
     except Exception:
         return str(target)
 
+# ========= Telethon client (tighter timeouts; IPv6 off helps on some VPS) =========
+client = TelegramClient(
+    SESSION_NAME,
+    API_ID,
+    API_HASH,
+    connection_retries=3,
+    request_retries=3,
+    retry_delay=2,
+    timeout=10,
+    use_ipv6=False,
+)
+
 # ========= Handler =========
 @client.on(events.NewMessage(chats=TARGETS))
 async def on_new_message(event):
@@ -183,8 +198,7 @@ async def on_new_message(event):
         try:
             size = os.path.getsize(path)
             if size <= MAX_UPLOAD_BYTES:
-                logger.info("IMAGE → Discord | channel='%s' | size=%d | caption='%s' | link='%s'",
-                            title, size, _collapse(raw_text), link or "-")
+                logger.info("IMAGE → Discord | channel='%s' | size=%d | link='%s'", title, size, link or "-")
                 post_file_to_discord(path, content=message)
             else:
                 logger.warning("SKIP IMAGE (too large) | channel='%s' | size=%d > %d | link='%s'",
@@ -196,7 +210,6 @@ async def on_new_message(event):
         return
 
     if isinstance(msg.media, MessageMediaDocument) and is_image_document(msg):
-        # Try to keep a sensible extension from mime type
         ext = ".img"
         mime = getattr(msg.document, "mime_type", "") or ""
         if "/" in mime:
@@ -208,8 +221,7 @@ async def on_new_message(event):
         try:
             size = os.path.getsize(path)
             if size <= MAX_UPLOAD_BYTES:
-                logger.info("IMAGE → Discord | channel='%s' | size=%d | caption='%s' | link='%s'",
-                            title, size, _collapse(raw_text), link or "-")
+                logger.info("IMAGE → Discord | channel='%s' | size=%d | link='%s'", title, size, link or "-")
                 post_file_to_discord(path, content=message)
             else:
                 logger.warning("SKIP IMAGE (too large) | channel='%s' | size=%d > %d | link='%s'",
@@ -222,19 +234,54 @@ async def on_new_message(event):
 
     # Text-only messages
     if raw_text:
-        logger.info("TEXT → Discord | channel='%s' | text='%s' | link='%s'",
-                    title, _collapse(raw_text), link or "-")
+        logger.info("TEXT → Discord | channel='%s' | link='%s'", title, link or "-")
         post_text_to_discord(message)
-    else:
-        logger.debug("IGNORED non-text/non-image message id=%s in channel='%s'", msg.id, title)
 
 # ========= Entrypoint =========
 async def main():
     logger.info("Starting… API_ID=%s HASH_len=%s Targets=%s", API_ID, len(API_HASH), TARGETS)
-    await client.start()  # first run: prompts phone/code/(2FA) in interactive terminal
 
-    # Build a friendly list of channel names for announcement
-    displays = await asyncio.gather(*[_display_name_for_target(client, t) for t in TARGETS])
+    # 1) Connect with timeouts; fail fast if Telegram is unreachable
+    logger.info("Connecting to Telegram (timeouts active)…")
+    try:
+        ok = await client.connect()
+        if not ok:
+            raise ConnectionError("client.connect() returned False")
+    except Exception as e:
+        logger.error("Failed to connect to Telegram: %s", e)
+        post_text_to_discord(f"Startup error: failed to connect to Telegram: {e}")
+        return
+
+    # 2) Check authorization (do we have a session?)
+    try:
+        authed = await client.is_user_authorized()
+    except Exception as e:
+        logger.error("Authorization check failed: %s", e)
+        post_text_to_discord(f"Startup error: authorization check failed: {e}")
+        return
+
+    if not authed:
+        # Only prompt if there is a TTY
+        if sys.stdin.isatty():
+            logger.info("No session found. Starting interactive login…")
+            try:
+                await client.start()   # prompts phone/code/(2FA)
+            except Exception as e:
+                logger.error("Interactive login failed: %s", e)
+                post_text_to_discord(f"Startup error: interactive login failed: {e}")
+                return
+        else:
+            msg = ("Startup error: not authorized and no interactive TTY available on this VPS. "
+                   "Run `python main.py` (or `python login.py`) manually once to log in.")
+            logger.error(msg)
+            post_text_to_discord(msg)
+            return
+
+    # 3) Announce startup
+    try:
+        displays = await asyncio.gather(*[_display_name_for_target(client, t) for t in TARGETS])
+    except Exception:
+        displays = [str(t) for t in TARGETS]
     announce = "Started listening to channels: " + ", ".join(displays)
     logger.info(announce)
     post_text_to_discord(announce)
